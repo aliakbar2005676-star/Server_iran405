@@ -53,4 +53,89 @@ function cleanName(n) {
   return n || "Player";
 }
 function freeColor() {
-  const used = new Set([...players.values()].map((p) => p
+  const used = new Set([...players.values()].map((p) => p.ci));
+  for (let i = 0; i < 64; i++) if (!used.has(i)) return i;
+  return 0;
+}
+function pub(p) {
+  return { id: p.id, name: p.name, ci: p.ci, x: p.x, y: p.y, z: p.z, yaw: p.yaw, pitch: p.pitch, has: p.has };
+}
+
+wss.on("connection", (ws) => {
+  let me = null;
+  ws.isAlive = true;
+  ws.on("pong", () => { ws.isAlive = true; });
+
+  ws.on("message", (data) => {
+    let m;
+    try { m = JSON.parse(data.toString()); } catch (e) { return; }
+    if (!m || typeof m.t !== "string") return;
+
+    if (me) {                                   // flood protection
+      const now = Date.now();
+      if (now - me.msgWindow > 1000) { me.msgWindow = now; me.msgCount = 0; }
+      if (++me.msgCount > MAX_MSGS_PER_SEC) return;
+    }
+
+    if (m.t === "join" && !me) {
+      if (players.size >= MAX_PLAYERS) {
+        send(ws, { t: "full" });
+        ws.close(1000, "full");
+        return;
+      }
+      me = { id: nextId++, ws, name: cleanName(m.name), ci: freeColor(), x: 0, y: 0, z: 0, yaw: 0, pitch: 0, has: false, dirty: false, msgCount: 0, msgWindow: Date.now() };
+      send(ws, { t: "welcome", id: me.id, max: MAX_PLAYERS, players: [...players.values()].map(pub) });
+      players.set(me.id, me);
+      broadcast({ t: "join", id: me.id, name: me.name, ci: me.ci }, me.id);
+      console.log(`+ ${me.name} (#${me.id})  ${players.size}/${MAX_PLAYERS}`);
+      return;
+    }
+    if (!me) return;
+
+    if (m.t === "p") {
+      const x = num(m.x), y = num(m.y), z = num(m.z), yaw = num(m.yaw), pitch = num(m.pitch);
+      if (x === null || y === null || z === null || yaw === null || pitch === null) return;
+      if (Math.abs(x) > WORLD_LIMIT || Math.abs(z) > WORLD_LIMIT || Math.abs(y) > 5000) return;
+      me.x = x; me.y = y; me.z = z; me.yaw = yaw; me.pitch = pitch; me.has = true; me.dirty = true;
+    } else if (m.t === "ping") {
+      send(ws, { t: "pong", ts: m.ts, n: players.size });
+    } else if (m.t === "chat") {
+      const text = String(m.m || "").slice(0, 120).trim();
+      if (text) broadcast({ t: "chat", id: me.id, name: me.name, m: text });
+    }
+  });
+
+  ws.on("close", () => {
+    if (me && players.get(me.id) === me) {
+      players.delete(me.id);
+      broadcast({ t: "leave", id: me.id });
+      console.log(`- ${me.name} (#${me.id})  ${players.size}/${MAX_PLAYERS}`);
+    }
+  });
+  ws.on("error", () => {});
+});
+
+// state tick: one packet per player with everybody else's position (only when something moved)
+setInterval(() => {
+  const moved = [...players.values()].filter((p) => p.dirty);
+  if (moved.length === 0) return;
+  for (const p of players.values()) {
+    const list = [];
+    for (const o of moved) {
+      if (o.id !== p.id) list.push([o.id, +o.x.toFixed(2), +o.y.toFixed(2), +o.z.toFixed(2), +o.yaw.toFixed(3), +o.pitch.toFixed(3)]);
+    }
+    if (list.length) send(p.ws, { t: "s", p: list });
+  }
+  for (const o of moved) o.dirty = false;
+}, TICK_MS);
+
+// drop dead connections (phone lost network)
+setInterval(() => {
+  for (const ws of wss.clients) {
+    if (ws.isAlive === false) { ws.terminate(); continue; }
+    ws.isAlive = false;
+    ws.ping();
+  }
+}, 25000);
+
+server.listen(PORT, () => console.log(`Iranian Island server on port ${PORT}, max ${MAX_PLAYERS} players`));
